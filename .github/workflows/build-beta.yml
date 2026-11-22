@@ -1,0 +1,115 @@
+name: Build Beta
+
+# 推送 main 分支后自动编译并发布到 beta 预发布。
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+      - ".gitignore"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: beta-release
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 生成版本号
+        id: ver
+        shell: pwsh
+        run: |
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          $version = "$(Get-Date -Format 'yyyyMMdd')-$sha"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "built_at=$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" >> $env:GITHUB_OUTPUT
+          Write-Host "版本号: $version"
+
+      - name: 静态检查与测试
+        shell: pwsh
+        run: |
+          go vet ./...
+          go test ./...
+
+      # 嵌入图标和 UAC 清单（失败时不影响构建，程序内部也会自行申请管理员权限）
+      - name: 嵌入图标与清单
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          go install github.com/akavel/rsrc@latest
+          $rsrc = Join-Path (go env GOPATH) 'bin\rsrc.exe'
+          & $rsrc -manifest app.manifest -ico HwName.ico -arch amd64 -o rsrc_windows_amd64.syso
+          if (Test-Path rsrc_windows_amd64.syso) { Write-Host "已生成资源文件" }
+
+      - name: 编译
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          go build -trimpath -buildvcs=false `
+            -ldflags "-s -w -H windowsgui -X main.buildVersion=${{ steps.ver.outputs.version }}" `
+            -o dist/HwName.exe .
+          if (-not (Test-Path dist/HwName.exe)) { throw "编译失败" }
+
+          Copy-Item NssmUI.exe dist/
+          Copy-Item README.md dist/
+          Copy-Item LICENSE dist/
+          Compress-Archive -Path dist/HwName.exe, dist/NssmUI.exe, dist/README.md, dist/LICENSE `
+            -DestinationPath dist/HwName-beta.zip -Force
+
+          Get-FileHash dist/HwName-beta.zip -Algorithm SHA256 | Format-List
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: HwName-beta-${{ steps.ver.outputs.version }}
+          path: dist/HwName-beta.zip
+          retention-days: 30
+
+      - name: 删除旧的 beta 发布
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete beta --cleanup-tag --yes 2>$null
+          Write-Host "已清理旧 beta（如存在）"
+          exit 0
+
+      - name: 发布 beta 预发布
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: beta
+          name: Beta ${{ steps.ver.outputs.version }}
+          prerelease: true
+          make_latest: false
+          files: dist/HwName-beta.zip
+          body: |
+            ### 自动构建的 beta 版本
+
+            | 项目 | 值 |
+            | --- | --- |
+            | 版本 | `${{ steps.ver.outputs.version }}` |
+            | 提交 | `${{ github.sha }}` |
+            | 分支 | `${{ github.ref_name }}` |
+            | 构建时间 | ${{ steps.ver.outputs.built_at }} |
+
+            下载 `HwName-beta.zip`，解压后运行 `HwName.exe`（需要管理员权限）。
+            请把 `HwName.exe` 和 `NssmUI.exe` 放在同一目录下使用。
+
+            提交信息：${{ github.event.head_commit.message }}
